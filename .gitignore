@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Config with API key / session cookies — keep local only
+.lit_web_config.json
+
+# Logs and temp files
+*.log
+*.tmp
+app_test.log
+
+# Claude internal
+.claude/
+
+# Old version
+literature_downloader.py
+ABS_Journal_Selector.html

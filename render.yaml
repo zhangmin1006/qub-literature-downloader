@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: literature-downloader
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --worker-class gthread --threads 4 --timeout 300 --bind 0.0.0.0:$PORT web_app:app
+    envVars:
+      - key: SCOPUS_API_KEY
+        sync: false          # set manually in Render dashboard
+      - key: SECRET_KEY
+        generateValue: true  # auto-generated random value
+      - key: RENDER
+        value: "true"
