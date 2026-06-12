@@ -11,6 +11,10 @@ __pycache__/
 *.tmp
 app_test.log
 
+# PyInstaller build artefacts (EXE rebuilt locally from spec)
+build/
+dist/
+
 # Claude internal
 .claude/
 

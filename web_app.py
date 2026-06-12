@@ -21,9 +21,19 @@ from flask import (Flask, jsonify, request, Response,
                    stream_with_context, render_template_string, send_file)
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
-BASE_DIR         = Path(__file__).parent
-ABS_XLSX         = BASE_DIR / "ABS.xlsx"
-CONFIG_FILE      = BASE_DIR / ".lit_web_config.json"
+# When packaged with PyInstaller --onefile, bundled read-only assets live in
+# sys._MEIPASS; user-writable config must sit next to the EXE, not in the
+# temp extraction dir which changes every run.
+if getattr(sys, "frozen", False):
+    _resource_dir = Path(sys._MEIPASS)
+    _config_dir   = Path(sys.executable).parent
+else:
+    _resource_dir = Path(__file__).parent
+    _config_dir   = _resource_dir
+
+BASE_DIR         = _resource_dir
+ABS_XLSX         = _resource_dir / "ABS.xlsx"
+CONFIG_FILE      = _config_dir   / ".lit_web_config.json"
 QUB_PROXY        = "qub.idm.oclc.org"
 UNPAYWALL_EMAIL  = "zhangmin1006@gmail.com"
 IS_ONLINE        = bool(os.environ.get("RENDER") or os.environ.get("RAILWAY_ENVIRONMENT")
@@ -2315,11 +2325,29 @@ function closeCookieGrabModal() {
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import socket as _socket
     port = int(os.environ.get("PORT", 5000))
+
+    # If already running, tell the user and exit instead of crashing
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
+        if _s.connect_ex(("127.0.0.1", port)) == 0:
+            msg = (f"LiteratureDownloader is already running.\n\n"
+                   f"Open  http://127.0.0.1:{port}  in your browser.")
+            if getattr(sys, "frozen", False):
+                ctypes.windll.user32.MessageBoxW(0, msg, "Already Running", 0x40)
+            else:
+                print(msg)
+            sys.exit(0)
+
     print("=" * 55)
     print("  Literature Auto-Downloader · QUB")
-    print(f"  Open: http://127.0.0.1:{port}")
+    print(f"  http://127.0.0.1:{port}")
+    print("  Close this window to stop the server.")
     print("=" * 55)
+
+    # Open browser 1.5 s after start so Flask has time to bind the port
     if not IS_ONLINE:
-        webbrowser.open(f"http://127.0.0.1:{port}")
-    app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
+        threading.Timer(1.5, webbrowser.open, args=(f"http://127.0.0.1:{port}",)).start()
+
+    host = "0.0.0.0" if IS_ONLINE else "127.0.0.1"
+    app.run(debug=False, host=host, port=port, threaded=True, use_reloader=False)
