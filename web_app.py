@@ -1044,6 +1044,12 @@ def api_launch_browser_for_cookie():
     else:
         _cdp_port = 9222
     tmp_profile = tempfile.mkdtemp(prefix="qub_cdp_")
+    # Use STARTUPINFO to force Chrome into a visible desktop window.
+    # Without this, Chrome launched from a hidden Flask process inherits the
+    # "no window" context and exits before binding the remote-debug port.
+    si = subprocess.STARTUPINFO()
+    si.dwFlags = subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 1   # SW_SHOWNORMAL
     subprocess.Popen(
         [chrome,
          f"--remote-debugging-port={_cdp_port}",
@@ -1051,7 +1057,8 @@ def api_launch_browser_for_cookie():
          "--no-first-run", "--no-default-browser-check",
          "--disable-extensions",
          "https://qub.idm.oclc.org/login"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        startupinfo=si,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
     return jsonify({"launched": True, "port": _cdp_port})
 
