@@ -569,10 +569,17 @@ def get_qub_cookies() -> dict:
     cfg    = load_config()
     manual = cfg.get("qub_session_cookie", "").strip()
     if manual:
-        # Support "name=value" format or bare value (assumed EZproxy cookie)
-        if "=" in manual and not manual.startswith("="):
-            name, _, val = manual.partition("=")
-            return {name.strip(): val.strip()}
+        # Supports "name=val; name2=val2" (multi-cookie from CDP auto-grab)
+        # or "name=val" (single cookie from manual paste)
+        # or bare value (legacy — assumed EZproxy)
+        if ";" in manual or ("=" in manual and not manual.startswith("=")):
+            result = {}
+            for part in manual.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, _, v = part.partition("=")
+                    result[k.strip()] = v.strip()
+            return result if result else {"EZproxy": manual}
         return {"EZproxy": manual}
     return get_browser_cookies(QUB_PROXY)
 
@@ -1085,14 +1092,19 @@ def api_grab_cookie_from_browser():
         return jsonify({"ready": False, "reason": "chrome_starting"})
     except Exception as e:
         return jsonify({"ready": False, "reason": str(e)})
-    ez_val = cookies.get("EZproxy")
-    if not ez_val:
+    # Accept any cookie whose name contains "ezproxy" (case-insensitive).
+    # QUB sets ezproxy, ezproxyl, ezproxyn — save all of them.
+    qub_cookies = {k: v for k, v in cookies.items()
+                   if "ezproxy" in k.lower()}
+    if not qub_cookies:
         return jsonify({"ready": True, "found": False,
                         "available": list(cookies.keys())[:10]})
     cfg = load_config()
-    cfg["qub_session_cookie"] = ez_val   # get_qub_cookies() wraps it as {"EZproxy": ez_val}
+    # Persist as "name=val; name2=val2" so get_qub_cookies() sends all of them
+    cfg["qub_session_cookie"] = "; ".join(f"{k}={v}" for k, v in qub_cookies.items())
     save_config(cfg)
-    return jsonify({"ready": True, "found": True, "cookie_name": "EZproxy"})
+    return jsonify({"ready": True, "found": True,
+                    "cookie_names": list(qub_cookies.keys())})
 
 @app.route("/api/config/qub-cookie", methods=["POST"])
 def api_config_qub_cookie():
@@ -2293,10 +2305,12 @@ async function autoConfigQubCookie() {
       if (d.found) {
         clearInterval(_cgTimer);
         document.getElementById('cgStatus').textContent = '✅';
-        document.getElementById('cgMsg').textContent = 'Cookie saved — QUB proxy downloads are enabled!';
+        const names = (d.cookie_names || ['ezproxy']).join(', ');
+        document.getElementById('cgMsg').textContent =
+          `Saved ${d.cookie_names ? d.cookie_names.length : 1} cookie(s): ${names} — QUB proxy downloads are enabled!`;
         _updateQubCookieUI(true);
         document.getElementById('btnClearQubCookie').style.display = '';
-        setTimeout(closeCookieGrabModal, 2000);
+        setTimeout(closeCookieGrabModal, 2500);
       }
     } catch (_) {}
   }, 2000);
