@@ -332,7 +332,7 @@ def _chromium_open_cookie_db(cookie_db: Path):
     uri = f"file:///{fwd}?mode=ro&immutable=1"
     for _ in range(5):
         try:
-            conn = sqlite3.connect(uri, uri=True, timeout=1)
+            conn = sqlite3.connect(uri, uri=True, timeout=0)
             conn.execute("SELECT 1 FROM cookies LIMIT 1")
             return conn, None
         except Exception:
@@ -615,10 +615,9 @@ def _download_worker(papers: list, folder: str, try_oa: bool, try_prx: bool) -> 
     ok = fail = skip = 0
     downloaded_paths = []
 
-    # Get QUB proxy cookies: manual config value or browser extraction
-    qub_cookies: dict = {}
-    if try_prx:
-        qub_cookies = get_qub_cookies()
+    # Defer QUB cookie extraction until we actually need it (lazy — avoids
+    # slow browser DB access for empty lists or OA-only jobs)
+    qub_cookies = None   # fetched lazily on first proxy attempt
 
     for idx, paper in enumerate(papers):
         if not _dl_active:
@@ -679,6 +678,8 @@ def _download_worker(papers: list, folder: str, try_oa: bool, try_prx: bool) -> 
 
         # 4) QUB proxy — with browser cookies + HTML citation_pdf_url parsing
         if not done and doi and try_prx:
+            if qub_cookies is None:          # fetch once, on first proxy attempt
+                qub_cookies = get_qub_cookies()
             tried.append("QUB-proxy")
             if try_proxy_download(doi, dest, session, extra_cookies=qub_cookies):
                 ok += 1; done = True
@@ -804,9 +805,14 @@ def api_download():
 def api_download_stream():
     """SSE endpoint — open after POST /api/download."""
     def generate():
+        # Send ~64 KB of SSE comment padding to immediately flush Werkzeug's
+        # dev-server TCP send buffer (default ~65 KB on Windows).  Without this,
+        # a small single-event response (e.g. an empty-list "done") sits in the
+        # OS send buffer for up to 30 s until a ping fires.
+        yield ": " + "x" * 65536 + "\n\n"
         while True:
             try:
-                msg = _dl_queue.get(timeout=30)
+                msg = _dl_queue.get(timeout=5)   # 5 s → frequent pings keep socket alive
                 yield f"data: {json.dumps(msg)}\n\n"
                 if msg.get("type") == "done":
                     break
