@@ -64,6 +64,9 @@ _dl_queue:  Queue = Queue()
 _dl_active: bool  = False
 _dl_zip_path: str = ""        # path to completed ZIP (online mode)
 
+# ── CDP AUTO-COOKIE STATE ──────────────────────────────────────────────────────
+_cdp_port: int = 0             # remote-debug port used by auto-configure flow
+
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 def load_config() -> dict:
@@ -398,6 +401,107 @@ def _extract_chromium_cookies(domain: str) -> dict:
         if result:
             return result
     return {}
+
+def _find_chrome_exe() -> str:
+    """Return path to Chrome executable, or '' if not found."""
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                     "Google", "Chrome", "Application", "chrome.exe"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    try:
+        import winreg
+        with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe") as k:
+            return winreg.QueryValueEx(k, "")[0]
+    except Exception:
+        return ""
+
+
+def _ws_build_frame(data: bytes) -> bytes:
+    """Build a masked WebSocket text frame (client→server)."""
+    mask = os.urandom(4)
+    n = len(data)
+    if n < 126:
+        hdr = bytes([0x81, 0x80 | n])
+    elif n < 65536:
+        hdr = struct.pack("!BBH", 0x81, 0xFE, n)
+    else:
+        hdr = struct.pack("!BBQ", 0x81, 0xFF, n)
+    return hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+
+
+def _ws_recv_message(sock) -> bytes:
+    """Read one complete (possibly fragmented) WebSocket message from sock."""
+    payload = b""
+    while True:
+        h = b""
+        while len(h) < 2:
+            h += sock.recv(2 - len(h))
+        fin     = (h[0] & 0x80) != 0
+        masked  = (h[1] & 0x80) != 0
+        n       = h[1] & 0x7F
+        if n == 126:
+            ex = b""
+            while len(ex) < 2: ex += sock.recv(2 - len(ex))
+            n = struct.unpack("!H", ex)[0]
+        elif n == 127:
+            ex = b""
+            while len(ex) < 8: ex += sock.recv(8 - len(ex))
+            n = struct.unpack("!Q", ex)[0]
+        mk = b""
+        if masked:
+            while len(mk) < 4: mk += sock.recv(4 - len(mk))
+        chunk = b""
+        while len(chunk) < n: chunk += sock.recv(n - len(chunk))
+        payload += bytes(b ^ mk[i % 4] for i, b in enumerate(chunk)) if masked else chunk
+        if fin:
+            return payload
+
+
+def cdp_get_qub_cookies(port: int) -> dict:
+    """Connect to Chrome's DevTools Protocol and return QUB cookies as {name: value}.
+    Chrome decrypts v20 cookies internally, so values are always plaintext here."""
+    import http.client as _http
+    import socket as _sock
+    conn = _http.HTTPConnection("localhost", port, timeout=3)
+    conn.request("GET", "/json")
+    targets = json.loads(conn.getresponse().read())
+    conn.close()
+    page = next((t for t in targets if t.get("type") == "page"), None)
+    if not page:
+        return {}
+    ws_path = page["webSocketDebuggerUrl"].split(f"localhost:{port}")[1]
+    sock = _sock.create_connection(("localhost", port), timeout=10)
+    sock.settimeout(10)
+    ws_key = base64.b64encode(os.urandom(16)).decode()
+    sock.sendall((
+        f"GET {ws_path} HTTP/1.1\r\nHost: localhost:{port}\r\n"
+        f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {ws_key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    ).encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        buf += sock.recv(4096)
+    sock.sendall(_ws_build_frame(
+        json.dumps({"id": 1, "method": "Network.getAllCookies"}).encode()
+    ))
+    while True:
+        msg = json.loads(_ws_recv_message(sock))
+        if msg.get("id") == 1:
+            break
+    sock.close()
+    return {
+        c["name"]: c["value"]
+        for c in msg.get("result", {}).get("cookies", [])
+        if QUB_PROXY in c.get("domain", "")
+    }
+
 
 def check_chromium_cookie_status(domain: str) -> dict:
     """Scan Chrome, Edge and Brave; return info on the browser with the most QUB cookies."""
@@ -918,6 +1022,61 @@ def api_proxy_cookies_test():
     except Exception as e:
         return jsonify({"success": False, "reason": "error", "message": str(e)})
 
+@app.route("/api/proxy-cookies/launch-browser", methods=["POST"])
+def api_launch_browser_for_cookie():
+    """Launch a fresh Chrome window with remote debugging so CDP can read cookies."""
+    global _cdp_port
+    if IS_ONLINE:
+        return jsonify({"error": "not available in online mode"}), 400
+    chrome = _find_chrome_exe()
+    if not chrome:
+        return jsonify({"error": "Chrome not found — please install Google Chrome."}), 404
+    import subprocess
+    import socket as _sock
+    # Find a free debug port (9222–9229)
+    for port in range(9222, 9230):
+        try:
+            s = _sock.create_connection(("localhost", port), timeout=0.2)
+            s.close()
+        except OSError:
+            _cdp_port = port
+            break
+    else:
+        _cdp_port = 9222
+    tmp_profile = tempfile.mkdtemp(prefix="qub_cdp_")
+    subprocess.Popen(
+        [chrome,
+         f"--remote-debugging-port={_cdp_port}",
+         f"--user-data-dir={tmp_profile}",
+         "--no-first-run", "--no-default-browser-check",
+         "--disable-extensions",
+         "https://qub.idm.oclc.org/login"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return jsonify({"launched": True, "port": _cdp_port})
+
+@app.route("/api/proxy-cookies/grab-from-browser")
+def api_grab_cookie_from_browser():
+    """Poll Chrome CDP for the EZproxy cookie; save and return when found."""
+    if IS_ONLINE:
+        return jsonify({"error": "not available"}), 400
+    if not _cdp_port:
+        return jsonify({"ready": False, "reason": "not_launched"})
+    try:
+        cookies = cdp_get_qub_cookies(_cdp_port)
+    except ConnectionRefusedError:
+        return jsonify({"ready": False, "reason": "chrome_starting"})
+    except Exception as e:
+        return jsonify({"ready": False, "reason": str(e)})
+    ez_val = cookies.get("EZproxy")
+    if not ez_val:
+        return jsonify({"ready": True, "found": False,
+                        "available": list(cookies.keys())[:10]})
+    cfg = load_config()
+    cfg["qub_session_cookie"] = ez_val   # get_qub_cookies() wraps it as {"EZproxy": ez_val}
+    save_config(cfg)
+    return jsonify({"ready": True, "found": True, "cookie_name": "EZproxy"})
+
 @app.route("/api/config/qub-cookie", methods=["POST"])
 def api_config_qub_cookie():
     cfg = load_config()
@@ -1256,6 +1415,7 @@ header .sub{font-size:.72rem;opacity:.65;margin-top:1px}
         The session expires when you log out of QUB Library — re-paste if downloads stop working.
       </span>
       <div style="margin-top:7px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-blue btn-sm" onclick="autoConfigQubCookie()">🔑 Auto-configure</button>
         <button class="btn btn-ghost btn-sm" onclick="testQubCookie()">🔌 Test QUB connection</button>
         <button class="btn btn-ghost btn-sm" onclick="clearQubCookie()" id="btnClearQubCookie" style="display:none">🗑 Clear saved cookie</button>
         <span id="qubCookieExistsMsg" style="font-size:.73rem;color:#2e7d32;display:none">✅ Cookie saved</span>
@@ -2074,7 +2234,74 @@ function toast(msg, dur=2800) {
   t.classList.add('show');
   setTimeout(() => t.classList.remove('show'), dur);
 }
+
+// ── AUTO-CONFIGURE QUB COOKIE ──────────────────────────────────────
+let _cgTimer = null;
+
+async function autoConfigQubCookie() {
+  const modal = document.getElementById('cookieGrabModal');
+  modal.style.display = 'flex';
+  document.getElementById('cgStatus').textContent = '⏳';
+  document.getElementById('cgMsg').textContent = 'Launching Chrome…';
+
+  let resp, data;
+  try {
+    resp = await fetch('/api/proxy-cookies/launch-browser', {method: 'POST'});
+    data = await resp.json();
+  } catch (e) {
+    document.getElementById('cgMsg').textContent = 'Network error: ' + e;
+    return;
+  }
+  if (data.error) {
+    document.getElementById('cgStatus').textContent = '❌';
+    document.getElementById('cgMsg').textContent = data.error;
+    return;
+  }
+
+  document.getElementById('cgMsg').innerHTML =
+    'A Chrome window has opened — log in to QUB.<br>' +
+    '<span style="color:#888;font-size:.82rem">This dialog closes automatically once the cookie is detected.</span>';
+
+  let tries = 0;
+  _cgTimer = setInterval(async () => {
+    if (++tries > 90) {
+      clearInterval(_cgTimer);
+      document.getElementById('cgStatus').textContent = '❌';
+      document.getElementById('cgMsg').textContent = 'Timed out after 3 minutes. Please try again.';
+      return;
+    }
+    try {
+      const r = await fetch('/api/proxy-cookies/grab-from-browser');
+      const d = await r.json();
+      if (d.found) {
+        clearInterval(_cgTimer);
+        document.getElementById('cgStatus').textContent = '✅';
+        document.getElementById('cgMsg').textContent = 'Cookie saved — QUB proxy downloads are enabled!';
+        _updateQubCookieUI(true);
+        document.getElementById('btnClearQubCookie').style.display = '';
+        setTimeout(closeCookieGrabModal, 2000);
+      }
+    } catch (_) {}
+  }, 2000);
+}
+
+function closeCookieGrabModal() {
+  clearInterval(_cgTimer);
+  document.getElementById('cookieGrabModal').style.display = 'none';
+}
 </script>
+
+<!-- Auto-configure QUB cookie modal -->
+<div id="cookieGrabModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:9999;align-items:center;justify-content:center">
+  <div style="background:#fff;border-radius:10px;padding:28px 32px;max-width:460px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.2)">
+    <h3 style="margin:0 0 12px;font-size:1.05rem">Auto-configure QUB Cookie</h3>
+    <div id="cgStatus" style="font-size:2rem;text-align:center;padding:10px 0">⏳</div>
+    <p id="cgMsg" style="color:#555;font-size:.88rem;margin:8px 0 18px;text-align:center;line-height:1.5">Launching Chrome…</p>
+    <div style="text-align:center">
+      <button class="btn btn-ghost btn-sm" onclick="closeCookieGrabModal()">Cancel</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>"""
 
